@@ -41,7 +41,6 @@ Steam-Picker/
 ├── main.py
 ├── steam_scanner.py
 ├── game_filter.py
-├── requirements.txt
 ├── art/
 │   └── cabinet.png
 └── SKINS/
