@@ -1,14 +1,3 @@
-"""
-game_filter.py
-
-Two jobs:
-1. Classify each app ID as a real "game" vs. something else (soundtrack,
-   SDK, dedicated server, redistributable, etc.) using the Steam Store
-   API - cached to disk so we only ever ask once per game, ever.
-2. Manage a simple exclude list (excluded.json) for games you own but
-   never want in the picker pool, regardless of type.
-"""
-
 import json
 import os
 import time
@@ -22,8 +11,6 @@ EXCLUDE_LIST_PATH = os.path.join(APP_DATA_DIR, "excluded.json")
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-
-# ---------- app type classification ----------
 
 def _load_type_cache() -> dict:
     if not os.path.exists(TYPE_CACHE_PATH):
@@ -42,12 +29,7 @@ def _save_type_cache(cache: dict) -> None:
 
 
 def _fetch_app_type(appid: str) -> Optional[str]:
-    """
-    Ask the Steam Store API what kind of app this is. Returns a lowercase
-    type string like "game", "dlc", "application", "tool", "demo",
-    "music", or None if the lookup failed (treated as unknown, not
-    filtered out - better to show an extra app than hide a real game).
-    """
+
     url = f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic"
     try:
         req = urllib.request.Request(url, headers=_HEADERS)
@@ -62,14 +44,7 @@ def _fetch_app_type(appid: str) -> Optional[str]:
 
 
 def classify_appids(appids: list[str], progress_callback=None) -> dict[str, str]:
-    """
-    Returns {appid: type} for every appid given. Cached results are used
-    as-is; anything new gets looked up and added to the cache.
 
-    progress_callback, if given, is called as (done_count, total_count)
-    after each new lookup - handy for a "checking library... 4/19" label
-    in the UI so classification doesn't look frozen.
-    """
     cache = _load_type_cache()
     to_fetch = [a for a in appids if a not in cache]
 
@@ -79,7 +54,6 @@ def classify_appids(appids: list[str], progress_callback=None) -> dict[str, str]
             cache[appid] = app_type
         if progress_callback:
             progress_callback(i, len(to_fetch))
-        # Be polite to Steam's API - avoid hammering it request-per-request
         time.sleep(0.2)
 
     if to_fetch:
@@ -87,8 +61,6 @@ def classify_appids(appids: list[str], progress_callback=None) -> dict[str, str]
 
     return {appid: cache.get(appid, "unknown") for appid in appids}
 
-
-# ---------- exclude list ----------
 
 def load_excluded() -> set[str]:
     if not os.path.exists(EXCLUDE_LIST_PATH):
@@ -118,18 +90,10 @@ def remove_from_excluded(appid: str) -> None:
     save_excluded(excluded)
 
 
-# ---------- combined filter ----------
-
-# Anything not in this set gets filtered out of the picker pool by default.
 GAME_TYPES = {"game"}
 
 
 def filter_games(games: list, progress_callback=None) -> list:
-    """
-    Takes a list of SteamGame objects (from steam_scanner) and returns
-    only the ones that are (a) actually classified as a game, not an
-    app/tool/dlc/etc, and (b) not on the manual exclude list.
-    """
     excluded = load_excluded()
     appids = [g.appid for g in games]
     types = classify_appids(appids, progress_callback=progress_callback)
@@ -141,7 +105,6 @@ def filter_games(games: list, progress_callback=None) -> list:
 
 
 if __name__ == "__main__":
-    # Manual test - run alongside steam_scanner.py to see filtering in action
     from steam_scanner import scan_installed_games
 
     all_games = scan_installed_games()

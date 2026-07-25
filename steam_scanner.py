@@ -1,16 +1,22 @@
-"""
-steam_scanner.py
+from __future__ import annotations
 
-Finds your Steam install, walks every library folder, and returns a clean
-list of installed games (name, appid, icon path). No network calls -
-everything is read straight off disk from Steam's own cache.
-"""
-
+import logging
 import os
 import re
-import winreg
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+
+LOGGER = logging.getLogger(__name__)
+_MANIFEST_RE = re.compile(r"^appmanifest_(\d+)\.acf$", re.IGNORECASE)
+_VDF_PAIR_RE = re.compile(r'"((?:\\.|[^"])*)"\s+"((?:\\.|[^"])*)"')
+_IMAGE_EXTENSIONS = {".ico", ".png", ".jpg", ".jpeg", ".webp"}
 
 
 @dataclass
@@ -19,289 +25,403 @@ class SteamGame:
     name: str
     install_dir: str
     icon_path: Optional[str] = None
+    icon_source: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ScanStats:
+    libraries: int = 0
+    manifests_seen: int = 0
+    malformed_manifests: int = 0
+    duplicates: int = 0
+    games: int = 0
+    icons_found: int = 0
+    missing_icons: int = 0
+
+
+LAST_SCAN_STATS = ScanStats()
+
+
+def _clean_vdf_value(value: str) -> str:
+    return value.replace(r"\\", "\\").replace(r"\"", '"')
+
+
+def _parse_vdf_kv(text: str) -> dict[str, str]:
+    return {
+        _clean_vdf_value(key).lower(): _clean_vdf_value(value)
+        for key, value in _VDF_PAIR_RE.findall(text)
+    }
+
+
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as exc:
+        LOGGER.warning("Could not read %s: %s", path, exc)
+        return None
 
 
 def find_steam_install() -> Optional[str]:
-    """
-    Locate the Steam install folder. Tries the Windows registry first,
-    then falls back to the handful of paths Steam almost always installs
-    to, in case the registry lookup comes back empty on this machine.
-    """
-    reg_paths = [
-        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
-    ]
-    for hive, path in reg_paths:
-        try:
-            with winreg.OpenKey(hive, path) as key:
-                install_path, _ = winreg.QueryValueEx(key, "SteamPath")
-                return os.path.normpath(install_path)
-        except (FileNotFoundError, OSError):
-            continue
+    if winreg is not None:
+        registry_values = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamExe"),
+            (
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\WOW6432Node\Valve\Steam",
+                "InstallPath",
+            ),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
+        ]
+        for hive, key_path, value_name in registry_values:
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    value, _ = winreg.QueryValueEx(key, value_name)
+                candidate = Path(value)
+                if value_name == "SteamExe":
+                    candidate = candidate.parent
+                if candidate.is_dir():
+                    return os.path.normpath(str(candidate))
+            except (FileNotFoundError, OSError, TypeError):
+                continue
 
-    fallback_paths = [
-        r"C:\Program Files (x86)\Steam",
-        r"C:\Program Files\Steam",
-    ]
-    for path in fallback_paths:
-        if os.path.isdir(path):
-            return os.path.normpath(path)
-
+    for candidate in (
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Steam",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Steam",
+        Path(r"C:\Program Files (x86)\Steam"),
+        Path(r"C:\Program Files\Steam"),
+    ):
+        if candidate.is_dir():
+            return os.path.normpath(str(candidate))
     return None
 
 
-def _parse_vdf_kv(text: str) -> dict:
-    """
-    Minimal VDF (Valve Data Format) parser - good enough for the flat
-    key/value pairs we need out of appmanifest and libraryfolders files.
-    Avoids pulling in an external vdf dependency for something this small.
-    """
-    result = {}
-    # Matches "key"   "value"
-    for match in re.finditer(r'"([^"]+)"\s+"([^"]*)"', text):
-        result[match.group(1).lower()] = match.group(2)
-    return result
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
 def find_library_folders(steam_path: str) -> list[str]:
-    """
-    Steam can install games across multiple drives. libraryfolders.vdf
-    (in steamapps/) lists every additional library path.
-    """
-    libraries = [os.path.join(steam_path, "steamapps")]
+    primary = Path(steam_path) / "steamapps"
+    candidates = [primary]
+    library_file = primary / "libraryfolders.vdf"
+    text = _read_text(library_file) if library_file.is_file() else None
+    if text:
+        for raw_path in re.findall(r'"path"\s+"((?:\\.|[^"])*)"', text, re.I):
+            candidates.append(Path(_clean_vdf_value(raw_path)) / "steamapps")
 
-    vdf_path = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
-    if not os.path.exists(vdf_path):
-        return libraries
-
-    with open(vdf_path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-
-    # Library entries look like:  "path"   "D:\\SteamLibrary"
-    for match in re.finditer(r'"path"\s+"([^"]+)"', text):
-        raw_path = match.group(1).replace("\\\\", "\\")
-        lib_steamapps = os.path.join(raw_path, "steamapps")
-        if lib_steamapps not in libraries and os.path.isdir(lib_steamapps):
-            libraries.append(lib_steamapps)
-
+    libraries: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = _path_key(candidate)
+        if key not in seen and candidate.is_dir():
+            seen.add(key)
+            libraries.append(os.path.normpath(str(candidate)))
     return libraries
 
 
 def _normalize_name(name: str) -> str:
-    """Strip trademark symbols/punctuation and lowercase, so 'South Park (TM):
-    The Stick of Truth' and 'south park the stick of truth' line up."""
-    return re.sub(r"[^\w\s]", "", name).strip().lower()
+    return re.sub(r"[^\w\s]", "", name, flags=re.UNICODE).strip().casefold()
 
 
 def find_shortcut_icons() -> dict[str, str]:
-    """
-    Steam creates a Start Menu shortcut per installed game, each pointing
-    at a correctly-matched .ico file. This turns out to be the most
-    reliable icon source we've got - no cache-layout guessing, no
-    network calls. Returns {normalized_game_name: icon_file_path}.
-    """
-    import glob
-
     try:
+        import glob
         import win32com.client
     except ImportError:
-        print("  [shortcut icons] pywin32 isn't installed - run: pip install pywin32")
+        LOGGER.debug("pywin32 unavailable; skipping shortcut icon fallback")
         return {}
 
-    search_dirs = [
-        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Steam",
-        os.path.join(
-            os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Steam"
-        ),
+    directories = [
+        Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+        / "Microsoft/Windows/Start Menu/Programs/Steam",
+        Path(os.environ.get("APPDATA", ""))
+        / "Microsoft/Windows/Start Menu/Programs/Steam",
     ]
-
-    # Only accept actual image files as icons. A shortcut's IconLocation
-    # can point at the game's .exe instead of a .ico if no custom icon
-    # was set - PIL can't open that, so treat it as "no icon" rather than
-    # silently storing an unusable path.
-    valid_exts = {".ico", ".png", ".jpg", ".jpeg"}
-
     mapping: dict[str, str] = {}
-    shell = win32com.client.Dispatch("WScript.Shell")
-    lnk_count = 0
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+    except Exception as exc:
+        LOGGER.debug("Could not initialize shortcut reader: %s", exc)
+        return mapping
 
-    for directory in search_dirs:
-        if not os.path.isdir(directory):
+    for directory in directories:
+        if not directory.is_dir():
             continue
-        for lnk_path in glob.glob(os.path.join(directory, "*.lnk")):
-            lnk_count += 1
+        for shortcut_path in glob.glob(str(directory / "*.lnk")):
             try:
-                shortcut = shell.CreateShortCut(lnk_path)
-                icon_file = (shortcut.IconLocation or "").split(",")[0].strip()
-                if os.path.splitext(icon_file)[1].lower() not in valid_exts:
-                    continue
-                if os.path.exists(icon_file):
-                    game_name = os.path.splitext(os.path.basename(lnk_path))[0]
-                    mapping[_normalize_name(game_name)] = icon_file
-            except Exception:
-                continue
-
-    print(f"  [shortcut icons] found {lnk_count} shortcuts, resolved {len(mapping)} usable icons")
+                shortcut = shell.CreateShortCut(shortcut_path)
+                icon_file = (shortcut.IconLocation or "").split(",", 1)[0].strip()
+                path = Path(os.path.expandvars(icon_file))
+                if path.suffix.lower() in _IMAGE_EXTENSIONS and path.is_file():
+                    mapping[_normalize_name(Path(shortcut_path).stem)] = str(path)
+            except Exception as exc:
+                LOGGER.debug("Could not inspect shortcut %s: %s", shortcut_path, exc)
     return mapping
 
 
-def match_shortcut_icon(game_name: str, shortcut_map: dict[str, str]) -> Optional[str]:
-    """Match a scanned game name against the shortcut map - exact match
-    first, then a fuzzy fallback for minor name differences."""
-    key = _normalize_name(game_name)
-    if key in shortcut_map:
-        return shortcut_map[key]
-
-    import difflib
-    close = difflib.get_close_matches(key, shortcut_map.keys(), n=1, cutoff=0.85)
-    return shortcut_map[close[0]] if close else None
+def match_shortcut_icon(
+    game_name: str, shortcut_map: dict[str, str]
+) -> Optional[str]:
+    return shortcut_map.get(_normalize_name(game_name))
 
 
-def find_icon(steam_path: str, appid: str) -> Optional[str]:
-    """
-    Steam caches artwork locally once a game's installed - no API call
-    needed for most games. Two things make this trickier than it should be:
+def _manifest_icon_hashes(data: dict[str, str]) -> list[str]:
+    hashes: list[str] = []
+    for key in ("clienticon", "icon"):
+        value = data.get(key, "").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{8,64}", value) and value not in hashes:
+            hashes.append(value)
+    return hashes
 
-    1. The small square "_icon.jpg" is only cached if you've triggered a
-       UI element that shows it, so it's missing for a lot of games.
-       Box art (library_600x900) is shown every time you browse your
-       library, so it's cached far more reliably - prioritize that.
-    2. Steam has used two different cache layouts over the years: older
-       installs use flat "<appid>_suffix.jpg" filenames, newer ones use
-       a per-appid folder. Check both.
-    """
-    cache_dir = os.path.join(steam_path, "appcache", "librarycache")
-    candidates = [
-        # Newer folder-based layout
-        os.path.join(cache_dir, appid, "library_600x900.jpg"),
-        os.path.join(cache_dir, appid, "icon.jpg"),
-        os.path.join(cache_dir, appid, "logo.jpg"),
-        # Older flat-file layout
-        os.path.join(cache_dir, f"{appid}_library_600x900.jpg"),
-        os.path.join(cache_dir, f"{appid}_icon.jpg"),
-        os.path.join(cache_dir, f"{appid}_logo.jpg"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
+
+def _existing_file(candidates: Iterable[Path]) -> Optional[str]:
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return os.path.normpath(str(candidate))
+        except OSError:
+            continue
     return None
 
 
-def fetch_icon_from_cdn(appid: str, cache_dir: str) -> Optional[str]:
-    """
-    Fallback for games with no locally cached art: pull box art straight
-    from Steam's public CDN (no API key required) and cache it to disk
-    so we only ever fetch it once per game.
-    """
-    import urllib.request
-    import urllib.error
+def _find_hashed_icon(steam_path: str, hashes: Iterable[str]) -> Optional[str]:
+    roots = (
+        Path(steam_path) / "steam/games",
+        Path(steam_path) / "games",
+        Path(steam_path) / "appcache/librarycache",
+    )
+    candidates: list[Path] = []
+    for icon_hash in hashes:
+        for root in roots:
+            for extension in (".ico", ".png", ".jpg", ".jpeg"):
+                candidates.append(root / f"{icon_hash}{extension}")
+    return _existing_file(candidates)
 
-    os.makedirs(cache_dir, exist_ok=True)
-    dest_path = os.path.join(cache_dir, f"{appid}.jpg")
-    if os.path.exists(dest_path):
-        return dest_path
 
-    # Steam's CDN 403s requests with no User-Agent, and not every game has
-    # both filename variants published - try a couple of combinations.
-    urls = [
-        f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg",
-        f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900_2x.jpg",
-        f"https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_600x900.jpg",
-    ]
+def _cache_candidates(steam_path: str, appid: str) -> Iterable[Path]:
+    cache = Path(steam_path) / "appcache/librarycache"
+    app_cache = cache / appid
 
-    for url in urls:
+    preferred_names = (
+        "clienticon.ico",
+        "clienticon.png",
+        "clienticon.jpg",
+        "icon.ico",
+        "icon.png",
+        "icon.jpg",
+    )
+    for name in preferred_names:
+        yield app_cache / name
+    for suffix in (
+        "_clienticon.ico",
+        "_clienticon.png",
+        "_clienticon.jpg",
+        "_icon.ico",
+        "_icon.png",
+        "_icon.jpg",
+    ):
+        yield cache / f"{appid}{suffix}"
+
+    if app_cache.is_dir():
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            yield from sorted(
+                (
+                    path
+                    for path in app_cache.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() in _IMAGE_EXTENSIONS
+                    and "icon" in path.stem.casefold()
+                ),
+                key=lambda path: (
+                    "clienticon" not in path.stem.casefold(),
+                    path.suffix.lower() != ".ico",
+                    path.name.casefold(),
+                ),
             )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = response.read()
-            with open(dest_path, "wb") as f:
-                f.write(data)
-            return dest_path
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        except OSError:
+            return
+
+
+def _find_square_cache_icon(steam_path: str, appid: str) -> Optional[str]:
+    app_cache = Path(steam_path) / "appcache/librarycache" / appid
+    if not app_cache.is_dir():
+        return None
+
+    try:
+        from PIL import Image
+    except ImportError:
+        LOGGER.debug("Pillow unavailable; cannot inspect hash-named cache images")
+        return None
+
+    candidates: list[tuple[int, int, Path]] = []
+    try:
+        files = app_cache.iterdir()
+    except OSError:
+        return None
+
+    for path in files:
+        if not path.is_file() or path.suffix.lower() not in _IMAGE_EXTENSIONS:
+            continue
+        if any(
+            word in path.stem.casefold()
+            for word in ("hero", "logo", "header", "capsule", "library")
+        ):
+            continue
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+        except (OSError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
             continue
 
-    return None
+        ratio = width / height
+        if 0.85 <= ratio <= 1.15:
+            squareness = abs(width - height)
+            area = width * height
+            candidates.append((squareness, area, path))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2].name.casefold()))
+    return os.path.normpath(str(candidates[0][2]))
+
+
+def find_icon(
+    steam_path: str,
+    appid: str,
+    metadata: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    hashes = _manifest_icon_hashes(metadata or {})
+
+    return (
+        _find_hashed_icon(steam_path, hashes)
+        or _existing_file(_cache_candidates(steam_path, appid))
+        or _find_square_cache_icon(steam_path, appid)
+    )
+
+
+def _resolve_icon(
+    steam_path: str,
+    appid: str,
+    name: str,
+    metadata: dict[str, str],
+    shortcut_icons: dict[str, str],
+) -> tuple[Optional[str], Optional[str]]:
+    hashes = _manifest_icon_hashes(metadata)
+    icon = _find_hashed_icon(steam_path, hashes)
+    if icon:
+        return icon, "steam icon hash"
+
+    icon = _existing_file(_cache_candidates(steam_path, appid))
+    if icon:
+        return icon, "Steam library cache"
+
+    icon = _find_square_cache_icon(steam_path, appid)
+    if icon:
+        return icon, "Steam square cache asset"
+
+    icon = match_shortcut_icon(name, shortcut_icons)
+    if icon:
+        return icon, "Start Menu shortcut"
+    return None, None
 
 
 def scan_installed_games(steam_path: Optional[str] = None) -> list[SteamGame]:
-    """
-    Main entry point. Returns every installed game found across all
-    Steam library folders, with a resolved icon path where available.
-    """
-    if steam_path is None:
-        steam_path = find_steam_install()
+    global LAST_SCAN_STATS
+
+    steam_path = steam_path or find_steam_install()
     if steam_path is None:
         raise RuntimeError(
             "Couldn't find a Steam install. Is Steam installed on this machine?"
         )
 
-    games = []
+    libraries = find_library_folders(steam_path)
+    if not libraries:
+        raise RuntimeError(f"No Steam library folders found under {steam_path!r}.")
+
     shortcut_icons = find_shortcut_icons()
+    games_by_appid: dict[str, SteamGame] = {}
+    manifests_seen = malformed = duplicates = icons_found = 0
 
-    for library in find_library_folders(steam_path):
-        if not os.path.isdir(library):
+    for library_name in libraries:
+        library = Path(library_name)
+        try:
+            manifests = sorted(library.glob("appmanifest_*.acf"))
+        except OSError as exc:
+            LOGGER.warning("Could not list Steam library %s: %s", library, exc)
             continue
-        for filename in os.listdir(library):
-            if not (filename.startswith("appmanifest_") and filename.endswith(".acf")):
+
+        for manifest in manifests:
+            manifests_seen += 1
+            filename_match = _MANIFEST_RE.match(manifest.name)
+            text = _read_text(manifest)
+            if text is None:
+                malformed += 1
                 continue
 
-            manifest_path = os.path.join(library, filename)
-            try:
-                with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
-                    data = _parse_vdf_kv(f.read())
-            except OSError:
-                continue
-
-            appid = data.get("appid")
-            name = data.get("name")
-            install_dir = data.get("installdir", "")
-            if not appid or not name:
-                continue
-
-            # Shortcut icons only - deliberately no fallback to box art or
-            # CDN cover images. Mixing square icons with rectangular cover
-            # art in the tiny screen cutout looked inconsistent, so a
-            # missing shortcut just means "no icon" (placeholder tile)
-            # rather than a mismatched photo.
-            icon_path = match_shortcut_icon(name, shortcut_icons)
-            icon_source = "shortcut" if icon_path else None
-
-            games.append(
-                SteamGame(
-                    appid=appid,
-                    name=name,
-                    install_dir=install_dir,
-                    icon_path=icon_path,
-                )
+            data = _parse_vdf_kv(text)
+            appid = data.get("appid") or (
+                filename_match.group(1) if filename_match else None
             )
-            games[-1].icon_source = icon_source  # type: ignore[attr-defined]
+            name = data.get("name", "").strip()
+            if not appid or not appid.isdigit() or not name:
+                malformed += 1
+                LOGGER.warning("Skipping malformed manifest: %s", manifest)
+                continue
 
-    # De-dupe just in case a game shows up in more than one library entry
-    seen = set()
-    unique_games = []
-    for g in games:
-        if g.appid not in seen:
-            seen.add(g.appid)
-            unique_games.append(g)
+            if appid in games_by_appid:
+                duplicates += 1
+                continue
 
-    return sorted(unique_games, key=lambda g: g.name.lower())
+            install_folder = data.get("installdir", "").strip()
+            install_dir = install_folder
+            icon_path, icon_source = _resolve_icon(
+                steam_path, appid, name, data, shortcut_icons
+            )
+            if icon_path:
+                icons_found += 1
+
+            games_by_appid[appid] = SteamGame(
+                appid=appid,
+                name=name,
+                install_dir=install_dir,
+                icon_path=icon_path,
+                icon_source=icon_source,
+            )
+
+    games = sorted(games_by_appid.values(), key=lambda game: game.name.casefold())
+    LAST_SCAN_STATS = ScanStats(
+        libraries=len(libraries),
+        manifests_seen=manifests_seen,
+        malformed_manifests=malformed,
+        duplicates=duplicates,
+        games=len(games),
+        icons_found=icons_found,
+        missing_icons=len(games) - icons_found,
+    )
+    LOGGER.info(
+        "Steam scan complete: %d games in %d libraries; %d icons found, "
+        "%d missing, %d malformed manifests, %d duplicates",
+        LAST_SCAN_STATS.games,
+        LAST_SCAN_STATS.libraries,
+        LAST_SCAN_STATS.icons_found,
+        LAST_SCAN_STATS.missing_icons,
+        LAST_SCAN_STATS.malformed_manifests,
+        LAST_SCAN_STATS.duplicates,
+    )
+    return games
 
 
 if __name__ == "__main__":
-    # Quick manual test - run this file directly on your own machine to
-    # sanity check the scanner before we wire up the GUI.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
         found = scan_installed_games()
-        print(f"\nFound {len(found)} installed games:\n")
-        for game in found:
-            source = getattr(game, "icon_source", None)
-            if game.icon_path:
-                status = f"icon found via {source}"
-            else:
-                status = "no icon"
-            print(f"  [{game.appid}] {game.name}  ({status})")
-    except RuntimeError as e:
-        print(f"Error: {e}")
+    except RuntimeError as exc:
+        raise SystemExit(f"Error: {exc}") from exc
+
+    print(f"\nFound {len(found)} installed games:\n")
+    for game in found:
+        status = game.icon_source or "no icon"
+        print(f"  [{game.appid}] {game.name} ({status})")
+    print(f"\nStats: {LAST_SCAN_STATS}")
