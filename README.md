@@ -1,109 +1,84 @@
-# Steam Picker
+# Steam Picker v1.0.0
 
-A tiny Windows desktop widget that randomly selects a game from your installed Steam library.
+![Steam Picker release banner](https://github.com/01170/Steam-Picker/blob/main/steam-picker-release-banner.png)
 
-Because everything needs gambling mechanics.
+Your Steam backlog, now with gambling mechanics.
 
-## Features
+Steam Picker is a tiny always-on-top Windows slot machine that scans your
+installed Steam libraries and chooses what you should play next.
 
-- Automatically discovers games across all installed Steam libraries
-- Uses Steam’s locally cached game icons
-- Animated slot-machine selection with a winner bounce
-- Prevents repeat winners and accidental click-spamming
-- Click the handle to reroll
+![Steam Picker demo](https://github.com/01170/Steam-Picker/blob/main/steam-picker-demo.gif)
+
+## Highlights
+
+- Automatically discovers games across every installed Steam library
+- Uses real square game icons from Steam's local artwork cache
+- Filters out tools, DLC, soundtracks, and other non-game entries
+- Animated slot-machine selection with an ease-out finish
+- Cute winner bounce when the final game lands
+- Prevents immediate repeats and rapid click-spamming
 - Click the Steam logo to launch the selected game
-- Right-click menu for playing, rerolling, excluding, and changing skins
-- Includes classic Valve-blue and pink sparkle cabinet skins
-- Always-on-top, draggable desktop widget
-- No Steam API key required
+- Right-click menu for Play, Reroll, Exclude, Change Skin, and Exit
+- Draggable, transparent, always-on-top desktop widget
+- Remembers excluded games locally
 
-## Download
+## Included Skins
 
-Download the latest `Steam Picker.exe` from the repository’s **Releases** page.
+- Black
+- Green
+- Pink
+- Purple
+- Red
+- Valve
 
-No Python installation is required when using the executable.
-
-Windows may display a SmartScreen warning because the application is not digitally signed. Choose **More info → Run anyway** if you downloaded it from this repository.
+Additional skins can be added under `SKINS/<skin name>/cabinet.png`.
 
 ## Controls
 
-- **Click the handle:** Pick another game
-- **Click the Steam logo:** Launch the displayed game
-- **Right-click the cabinet:** Open the action and skin menu
-- **Click and drag:** Move the cabinet
-- **Esc:** Close Steam Picker
+| Action | Control |
+| --- | --- |
+| Pick another game | Click the cabinet handle |
+| Launch the selected game | Click the Steam logo |
+| Open actions and skins | Right-click the cabinet |
+| Move the widget | Click and drag |
+| Close Steam Picker | Press `Esc` |
 
-## Running from Source
+## Download
 
-### Requirements
+Download **Steam Picker.exe** from the assets attached to this release and
+double-click it to start.
 
-- Windows
-- Python 3.10 or newer
-- Steam
-- Pillow
+Python is not required when using the executable.
 
-Install the required package:
+> [!NOTE]
+> Windows may show a SmartScreen warning because the executable is not
+> digitally signed. If you downloaded it from this repository, select
+> **More info → Run anyway**.
 
-```bash
-pip install -r requirements.txt
-```
+## Requirements
 
-Start Steam Picker:
+- Windows 10 or newer
+- Steam installed
+- At least one installed Steam game
 
-```bash
-python main.py
-```
+Steam does not need to be running when Steam Picker starts. It will open
+automatically when you launch the selected game.
 
-Steam must be installed, but it does not need to be running when Steam Picker starts.
+## Local Data
 
-## Project Structure
-
-```text
-Steam-Picker/
-├── main.py
-├── steam_scanner.py
-├── game_filter.py
-├── art/
-│   └── cabinet.png
-└── SKINS/
-    ├── Pink/
-    │   └── cabinet.png
-    └── Valve/
-        └── cabinet.png
-```
-
-## Custom Skins
-
-Create a folder inside `SKINS/` and place a file named `cabinet.png` inside it:
+Steam Picker stores its classification cache and exclusions in:
 
 ```text
-SKINS/
-└── My Skin/
-    └── cabinet.png
+%LOCALAPPDATA%\GamePicker
 ```
 
-Steam Picker discovers new skins automatically and adds them to the right-click menu.
+Delete `excluded.json` from that folder to restore all excluded games.
 
-Cabinet artwork must:
+## Known Limitations
 
-- Be exactly **240×320 pixels**
-- Use a transparent background
-- Preserve the screen, logo, name bar, and handle positions
+- Windows only
+- Game artwork must already exist in Steam's local cache
+- The first source-code run may take longer while app classifications are
+  downloaded and cached
 
-## Excluded Games
-
-Right-click the cabinet and select **Exclude** to remove the displayed game from future rolls.
-
-Exclusions are saved locally in:
-
-```text
-%LOCALAPPDATA%\GamePicker\excluded.json
-```
-
-Deleting that file restores every excluded game.
-
-## Notes
-
-Steam Picker reads installed-game metadata and artwork from files already maintained by Steam. Store classification results and exclusions are cached locally to make future launches faster.
-
-Originally built over a VC as a quick, slightly ridiculous solution for friends who couldn't decide what to play.
+Built as a fun solution for friends who could not decide what to play.
